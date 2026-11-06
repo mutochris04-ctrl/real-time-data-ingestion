@@ -1,0 +1,13 @@
+PostgreSQL connection details
+=============================
+Host:      localhost
+Port:      5432
+Database:  ecommerce_events
+User:      postgres
+Password:  not stored in this file (the repository is public).
+           Set it in the terminal before starting Spark:
+           $env:PG_PASSWORD = "your_password"
+           spark_streaming_to_postgres.py reads it with os.environ.get("PG_PASSWORD").
+
+Tables:    events         (one row per valid event, event_id is the primary key)
+           batch_metrics  (one row per Spark batch, used for performance evidence)
