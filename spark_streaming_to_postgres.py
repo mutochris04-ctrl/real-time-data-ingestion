@@ -39,9 +39,9 @@ events = (spark.readStream
 
 # 5. Cleaning rules
 def clean_events(df):
-    df = df.filter(col("event_id").isNotNull())
-    df = df.filter(col("user_id").isNotNull())
-    df = df.filter(col("product_id").isNotNull())
+    df = df.filter(col("event_id").isNotNull() & (col("event_id") != ""))
+    df = df.filter(col("user_id").isNotNull() & (col("user_id") != ""))
+    df = df.filter(col("product_id").isNotNull() & (col("product_id") != ""))
     df = df.filter(col("event_time").isNotNull())
     df = df.filter(col("event_type").isin("view", "purchase"))
     # a purchase must have an amount above 0  ( | means "or" )
