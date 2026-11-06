@@ -16,7 +16,10 @@ Pipeline working: events flow from Python, through Spark, into PostgreSQL.
 
 1. Install the requirements:
    `pip install -r requirements.txt`
-2. Create the tables by running `postgres_setup.sql` in pgAdmin.
+2. Set up the database in pgAdmin:
+   - Run `CREATE DATABASE ecommerce_events;` on its own first.
+   - Connect to the `ecommerce_events` database.
+   - Run the rest of `postgres_setup.sql` to create the tables.
 3. Terminal 1 – start Spark:
    ```
    $env:PG_PASSWORD = "your_password"
