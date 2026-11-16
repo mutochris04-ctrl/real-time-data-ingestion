@@ -2,6 +2,7 @@
 
 Flow:  input_data/*.csv  ->  Spark (clean + derived columns)  ->  PostgreSQL
        good rows -> events | bad rows -> rejected_events (with the reason) | counts -> batch_metrics
+       per-minute totals (watermark + window) -> window_metrics
 """
 import time
 
@@ -10,16 +11,23 @@ from psycopg2.extras import execute_values
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType
 from pyspark.sql.functions import (col, lit, when, trim, lower, try_to_timestamp,
-                                   current_timestamp, to_date, hour, unix_timestamp)
+                                   current_timestamp, to_date, hour, unix_timestamp,
+                                   window, count, sum)
 
 import config   # reads the database settings from the .env file
 
 # 1. Settings
 input_folder = "input_data"
 checkpoint_folder = "checkpoints/events"
+window_checkpoint_folder = "checkpoints/windows"
+watermark_delay = "10 minutes"   # how long Spark waits for late events
+window_size = "1 minute"         # size of each time window
 
 # 2. Start Spark
-spark = SparkSession.builder.appName("EcommerceStream").getOrCreate()
+spark = (SparkSession.builder
+         .appName("EcommerceStream")
+         .config("spark.sql.shuffle.partitions", "4")   # 4 groups instead of 200: faster on one laptop
+         .getOrCreate())
 spark.sparkContext.setLogLevel("WARN")
 
 # 3. Schema on read: every column is read as text first.
@@ -155,15 +163,69 @@ def save_batch(batch_df, batch_id):
           "| rejected:", len(bad_values), "| inserted:", len(inserted), "| seconds:", seconds)
 
 
-# 9. Start the stream, with checkpointing (Spark remembers which files are already done)
-query = (events.writeStream
-         .queryName("events_to_postgres")
-         .foreachBatch(save_batch)
-         .option("checkpointLocation", checkpoint_folder)
-         .trigger(processingTime="5 seconds")
-         .start())
+# 9. Watermark + window aggregation: events and revenue per 1-minute window
+#    Like a shop counting customers every minute: the watermark says how long we keep a minute "open"
+#    for customers who arrive late. An event more than 10 minutes late is too late and is ignored.
+def build_window_stream(stream):
+    checked = add_reason(clean_and_type(stream)).filter(col("reason").isNull())
+    checked = checked.withColumn("total_amount",
+                                 when(col("event_type") == "purchase",
+                                      col("price_number") * col("quantity_number")).otherwise(0))
+    return (checked
+            .withWatermark("event_timestamp", watermark_delay)
+            .dropDuplicatesWithinWatermark(["event_id"])          # count each event only once
+            .groupBy(window(col("event_timestamp"), window_size), col("event_type"))
+            .agg(count("*").alias("event_count"),
+                 sum("total_amount").alias("total_revenue")))
+
+
+# 10. Save the window results: UPSERT (insert a new window, or update it if late events changed it)
+def save_windows(batch_df, batch_id):
+    rows = batch_df.select(col("window.start"), col("window.end"), "event_type",
+                           "event_count", "total_revenue").collect()
+    if len(rows) == 0:
+        return
+
+    values = []
+    for row in rows:
+        values.append(list(row))
+
+    connection = psycopg2.connect(host=config.DB_HOST, port=config.DB_PORT, dbname=config.DB_NAME,
+                                  user=config.DB_USER, password=config.DB_PASSWORD)
+    cursor = connection.cursor()
+    execute_values(
+        cursor,
+        """INSERT INTO window_metrics (window_start, window_end, event_type, event_count, total_revenue)
+           VALUES %s
+           ON CONFLICT (window_start, event_type)
+           DO UPDATE SET event_count   = EXCLUDED.event_count,
+                         total_revenue = EXCLUDED.total_revenue,
+                         updated_at    = NOW()""",
+        values, page_size=1000)
+    connection.commit()
+    cursor.close()
+    connection.close()
+
+    print("Window batch", batch_id, "| windows saved or updated:", len(values))
+
+
+# 11. Start both streams, each with its own checkpoint (Spark remembers which files are already done)
+events_query = (events.writeStream
+                .queryName("events_to_postgres")
+                .foreachBatch(save_batch)
+                .option("checkpointLocation", checkpoint_folder)
+                .trigger(processingTime="5 seconds")
+                .start())
+
+windows_query = (build_window_stream(events).writeStream
+                 .queryName("windows_to_postgres")
+                 .outputMode("update")                 # only send windows that changed in this batch
+                 .foreachBatch(save_windows)
+                 .option("checkpointLocation", window_checkpoint_folder)
+                 .trigger(processingTime="5 seconds")
+                 .start())
 
 print("Streaming started. Waiting for files in", input_folder, "... (Ctrl+C to stop)")
 
-# 10. Keep running
-query.awaitTermination()
+# 12. Keep running until one of the streams stops
+spark.streams.awaitAnyTermination()
