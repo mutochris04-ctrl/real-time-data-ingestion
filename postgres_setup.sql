@@ -1,6 +1,6 @@
 -- PostgreSQL setup for the e-commerce streaming lab (database: ecommerce_events)
--- Docker runs this file automatically the first time the PostgreSQL container starts.
--- (Without Docker: create the database ecommerce_events first, connect to it, then run this file.)
+-- Run in pgAdmin: first create the database ecommerce_events (Step A), then open a Query Tool on it and run this file.
+-- Step A (run alone, on the postgres database): CREATE DATABASE ecommerce_events;
 
 -- 1. Clean events: one row per valid event (Spark writes here)
 CREATE TABLE IF NOT EXISTS events (
@@ -79,3 +79,10 @@ CREATE TABLE IF NOT EXISTS stream_progress (
     add_batch_ms              BIGINT,          -- time spent in foreachBatch (writing)
     recorded_at               TIMESTAMP DEFAULT NOW()
 );
+
+-- 6. Extra indexes for the new tables (questions I ask while monitoring the pipeline)
+--    window_metrics needs no extra index: its PRIMARY KEY (window_start, event_type) is already an index.
+CREATE INDEX IF NOT EXISTS idx_events_category        ON events (category);                        -- revenue per category
+CREATE INDEX IF NOT EXISTS idx_rejected_reason        ON rejected_events (reason);                 -- how many rows were rejected, per reason
+CREATE INDEX IF NOT EXISTS idx_batch_metrics_batch    ON batch_metrics (batch_id);                 -- find one batch quickly
+CREATE INDEX IF NOT EXISTS idx_progress_query_time    ON stream_progress (query_name, recorded_at); -- latest progress of one stream

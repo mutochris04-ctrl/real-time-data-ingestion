@@ -20,7 +20,7 @@ import config   # reads the database settings from the .env file
 input_folder = "input_data"
 checkpoint_folder = "checkpoints/events"
 window_checkpoint_folder = "checkpoints/windows"
-watermark_delay = "10 minutes"   # how long Spark waits for late events
+watermark_delay = "10 minutes"   # how late an event can be and still count in its window
 window_size = "1 minute"         # size of each time window
 
 # 2. Start Spark
@@ -31,7 +31,7 @@ spark = (SparkSession.builder
 spark.sparkContext.setLogLevel("WARN")
 
 # 3. Schema on read: every column is read as text first.
-#    A bad value (like price "abc") can then never crash the stream; we check it ourselves in step 5.
+#    This lets us inspect a bad value (like price "abc") ourselves in step 5, before converting the types.
 schema = StructType([
     StructField("event_id", StringType()),
     StructField("user_id", StringType()),
@@ -51,7 +51,7 @@ events = (spark.readStream
           .csv(input_folder))
 
 
-# 5. Clean the text and give each column its real type (schema on write)
+# 5. Clean the text and convert each column to its real type (type conversion)
 def clean_and_type(df):
     df = df.withColumn("event_id", trim(col("event_id")))
     df = df.withColumn("user_id", trim(col("user_id")))
@@ -88,7 +88,7 @@ def add_derived_columns(df):
     df = df.withColumn("event_date", to_date(col("event_timestamp")))
     df = df.withColumn("event_hour", hour(col("event_timestamp")))
     df = df.withColumn("ingestion_time", current_timestamp())   # when Spark processed it
-    df = df.withColumn("latency_seconds",                        # how late it arrived
+    df = df.withColumn("latency_seconds",                        # event-to-ingestion delay (seconds)
                        unix_timestamp(col("ingestion_time")) - unix_timestamp(col("event_timestamp")))
     return df
 
@@ -97,8 +97,13 @@ def add_derived_columns(df):
 def save_batch(batch_df, batch_id):
     start = time.time()
 
+    # persist = keep this batch in memory, so Spark reads the files only ONCE
+    # (without it, count() and each collect() below would read the same files again)
+    batch_df.persist()
+
     rows_received = batch_df.count()
     if rows_received == 0:
+        batch_df.unpersist()
         return
 
     checked = add_reason(clean_and_type(batch_df))
@@ -125,7 +130,7 @@ def save_batch(batch_df, batch_id):
                                   user=config.DB_USER, password=config.DB_PASSWORD)
     cursor = connection.cursor()
 
-    # Bulk insert: ONE command for all good rows (instead of one command per row).
+    # Batch insertion: execute_values sends the good rows in pages of up to 1000 (instead of one insert per row).
     # ON CONFLICT DO NOTHING skips an event_id that is already saved (duplicate from an earlier batch).
     # RETURNING tells us which rows were really inserted.
     inserted = []
@@ -158,6 +163,7 @@ def save_batch(batch_df, batch_id):
     connection.commit()      # all or nothing: the batch is saved completely, or not at all
     cursor.close()
     connection.close()
+    batch_df.unpersist()     # free the memory: this batch is finished
 
     print("Batch", batch_id, "| received:", rows_received, "| valid:", len(good_values),
           "| rejected:", len(bad_values), "| inserted:", len(inserted), "| seconds:", seconds)
@@ -227,5 +233,50 @@ windows_query = (build_window_stream(events).writeStream
 
 print("Streaming started. Waiting for files in", input_folder, "... (Ctrl+C to stop)")
 
-# 12. Keep running until one of the streams stops
+# 12. Monitoring: save Spark's own progress numbers into stream_progress
+#     query.recentProgress = Spark's list of reports for the last batches (newest at the end)
+def save_progress(query, saved_times):
+    """Save every new report that has rows. saved_times is a list of reports already saved."""
+    for progress in query.recentProgress:
+        report_time = progress["timestamp"]          # every report has its own time
+        if report_time in saved_times:
+            continue                                  # already saved this report
+        saved_times.append(report_time)
+        if progress["numInputRows"] == 0:
+            continue                                  # idle report (no new files): nothing to save
+
+        durations = progress["durationMs"]           # how many milliseconds each part of the batch took
+        values = (query.name,
+                  progress["batchId"],
+                  progress["numInputRows"],              # rows read in this batch
+                  progress["inputRowsPerSecond"],        # how fast rows arrived
+                  progress["processedRowsPerSecond"],    # how fast Spark processed them
+                  durations.get("triggerExecution", 0),  # time for the whole batch
+                  durations.get("addBatch", 0))          # time spent writing (our foreachBatch)
+
+        connection = psycopg2.connect(host=config.DB_HOST, port=config.DB_PORT, dbname=config.DB_NAME,
+                                      user=config.DB_USER, password=config.DB_PASSWORD)
+        cursor = connection.cursor()
+        cursor.execute(
+            """INSERT INTO stream_progress (query_name, batch_id, num_input_rows, input_rows_per_second,
+                                            processed_rows_per_second, trigger_duration_ms, add_batch_ms)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            values)
+        connection.commit()
+        cursor.close()
+        connection.close()
+
+        print("Progress |", query.name, "| batch", progress["batchId"], "| rows:", progress["numInputRows"],
+              "| processed rows/sec:", round(progress["processedRowsPerSecond"], 1))
+
+
+# 13. Keep running: every 5 seconds, save the new progress reports of both streams
+events_saved = []
+windows_saved = []
+while events_query.isActive and windows_query.isActive:
+    time.sleep(5)
+    save_progress(events_query, events_saved)
+    save_progress(windows_query, windows_saved)
+
+# If a stream stopped because of an error, this shows the error message
 spark.streams.awaitAnyTermination()
