@@ -4,10 +4,11 @@ Host:      localhost
 Port:      5432
 Database:  ecommerce_events
 User:      postgres
-Password:  not stored in this file (the repository is public).
-           Set it in the terminal before starting Spark:
-           $env:PG_PASSWORD = "your_password"
-           spark_streaming_to_postgres.py reads it with os.environ.get("PG_PASSWORD").
+Password:  stored only in the .env file (copy .env.example to .env); .env is not pushed to GitHub
+           config.py reads PG_HOST, PG_PORT, PG_DATABASE, PG_USER and PG_PASSWORD from .env.
 
 Tables:    events         (one row per valid event, event_id is the primary key)
            batch_metrics  (one row per Spark batch, used for performance evidence)
+           rejected_events (bad rows with the reason they were rejected)
+           window_metrics (1-minute windows per event_type, with watermark)
+           stream_progress (Spark's own progress numbers for each batch)

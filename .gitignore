@@ -1,3 +1,9 @@
 checkpoints/
 __pycache__/
 input_data/
+
+# Secret settings (copy .env.example to .env)
+.env
+
+# Made by data_generator.py on every run (answer key for testing)
+generator_log.csv
